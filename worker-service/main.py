@@ -6,7 +6,6 @@ import os
 from datetime import datetime
 import time
 
-
 # Database configuration
 DB_CONFIG = {
     "host": os.getenv("MYSQL_HOST", "mysql_db"),
@@ -23,39 +22,47 @@ RABBITMQ_CONFIG = {
 }
 
 def get_db_connection():
+    """Establish and return a MySQL database connection."""
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         return conn
     except mysql.connector.Error as e:
-        print(f"Database connection failed: {str(e)}")
+        print(f"[Worker] Database connection failed: {str(e)}")
         return None
 
 def update_task_status(task_id: str, status: str, completed_at: Optional[datetime] = None):
+    """Update task status in the database."""
     conn = get_db_connection()
     if not conn:
+        print(f"[Worker] Cannot update status for task {task_id}: No database connection")
         return False
     
     cursor = conn.cursor()
     try:
         if completed_at:
             update_query = """
-                UPDATE tasks 
-                SET status = %s, completed_at = %s, updated_at = NOW()
-                WHERE id = %s
+            UPDATE tasks 
+            SET status = %s, completed_at = %s, updated_at = NOW()
+            WHERE id = %s
             """
             cursor.execute(update_query, (status, completed_at, task_id))
         else:
             update_query = """
-                UPDATE tasks 
-                SET status = %s, updated_at = NOW()
-                WHERE id = %s
+            UPDATE tasks 
+            SET status = %s, updated_at = NOW()
+            WHERE id = %s
             """
             cursor.execute(update_query, (status, task_id))
         
         conn.commit()
-        return cursor.rowcount > 0
+        rows_affected = cursor.rowcount
+        if rows_affected > 0:
+            print(f"[Worker] Task {task_id} status updated to '{status}'")
+        else:
+            print(f"[Worker] Warning: Task {task_id} not found in database")
+        return rows_affected > 0
     except mysql.connector.Error as e:
-        print(f"Failed to update task status: {str(e)}")
+        print(f"[Worker] Failed to update task {task_id} status: {str(e)}")
         conn.rollback()
         return False
     finally:
@@ -64,18 +71,26 @@ def update_task_status(task_id: str, status: str, completed_at: Optional[datetim
 
 def process_task(task_data: Dict):
     """
-    Process a task asynchronously
+    Process a task asynchronously.
+    Extracts task details, simulates processing, and updates task status.
     """
     task_id = task_data.get('task_id')
+    title = task_data.get('title', 'N/A')
+    description = task_data.get('description', 'N/A')
+    metadata = task_data.get('metadata', {})
     
     if not task_id:
-        print("[Worker] Missing task_id in message")
+        print("[Worker] Error: Missing task_id in message")
         return False
     
     try:
         print(f"[Worker] Processing task: {task_id}")
+        print(f"[Worker] Title: {title}")
+        print(f"[Worker] Description: {description}")
+        if metadata:
+            print(f"[Worker] Metadata: {json.dumps(metadata)}")
         
-        # Update status to PROCESSING (optional)
+        # Update status to PROCESSING (optional but good for tracking)
         update_task_status(task_id, 'PROCESSING')
         
         # Simulate work (5-10 seconds)
@@ -83,25 +98,31 @@ def process_task(task_data: Dict):
         print(f"[Worker] Simulating work for {processing_time} seconds...")
         time.sleep(processing_time)
         
-        # Update status to COMPLETED
+        # Update status to COMPLETED with timestamp
         completed_at = datetime.now()
         if update_task_status(task_id, 'COMPLETED', completed_at):
-            print(f"[Worker] Task {task_id} completed successfully at {completed_at}")
+            print(f"[Worker] Task {task_id} completed successfully at {completed_at.isoformat()}")
             return True
         else:
-            print(f"[Worker] Failed to update task {task_id} status")
+            print(f"[Worker] Failed to update task {task_id} status to COMPLETED")
             return False
-    
+        
     except Exception as e:
         print(f"[Worker] Error processing task {task_id}: {str(e)}")
+        try:
+            update_task_status(task_id, 'FAILED')
+        except Exception as update_error:
+            print(f"[Worker] Could not update task status to FAILED: {str(update_error)}")
         return False
 
 def callback(ch, method, properties, body):
     """
-    Callback function for RabbitMQ message consumption
+    Callback function for RabbitMQ message consumption.
+    Processes each message and acknowledges or negatively acknowledges based on result.
     """
     try:
         task_data = json.loads(body.decode('utf-8'))
+        print(f"[Worker] Received message for task: {task_data.get('task_id', 'Unknown')}")
         
         # Process the task
         success = process_task(task_data)
@@ -113,21 +134,22 @@ def callback(ch, method, properties, body):
         else:
             # Negative acknowledgment - message will be requeued
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            print(f"[Worker] Message NACKed for task {task_data.get('task_id')}")
-    
+            print(f"[Worker] Message NACKed for task {task_data.get('task_id')} - will be retried")
+        
     except json.JSONDecodeError as e:
-        print(f"[Worker] Invalid JSON in message: {str(e)}")
+        print(f"[Worker] Error: Invalid JSON in message: {str(e)}")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-    
+        
     except Exception as e:
         print(f"[Worker] Unexpected error in callback: {str(e)}")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 def start_worker():
     """
-    Start the worker service and begin consuming messages
+    Start the worker service and begin consuming messages from RabbitMQ.
     """
     print("[Worker] Starting worker service...")
+    print(f"[Worker] Connecting to RabbitMQ at {RABBITMQ_CONFIG['host']}...")
     
     # Connect to RabbitMQ
     try:
@@ -136,11 +158,15 @@ def start_worker():
         connection = pika.BlockingConnection(parameters)
         channel = connection.channel()
         
-        # Declare queue (durable)
+        print("[Worker] Successfully connected to RabbitMQ")
+        
+        # Declare queue (durable to survive broker restarts)
         channel.queue_declare(queue='task_queue', durable=True)
+        print("[Worker] Queue 'task_queue' declared")
         
         # Set prefetch count to 1 (process one message at a time)
         channel.basic_qos(prefetch_count=1)
+        print("[Worker] Prefetch count set to 1")
         
         # Consume messages
         print("[Worker] Waiting for messages. To exit press CTRL+C")
@@ -148,10 +174,14 @@ def start_worker():
         
         # Start consuming
         channel.start_consuming()
-    
+        
+    except pika.exceptions.AMQPConnectionError as e:
+        print(f"[Worker] RabbitMQ connection error: {str(e)}")
+        print("[Worker] Make sure RabbitMQ is running and accessible")
+        exit(1)
     except KeyboardInterrupt:
         print("\n[Worker] Worker stopped by user")
-    
+        
     except Exception as e:
         print(f"[Worker] Fatal error: {str(e)}")
         exit(1)
