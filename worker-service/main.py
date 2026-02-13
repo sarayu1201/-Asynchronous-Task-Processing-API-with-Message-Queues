@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 import time
 
+
 # Database configuration
 DB_CONFIG = {
     "host": os.getenv("MYSQL_HOST", "mysql_db"),
