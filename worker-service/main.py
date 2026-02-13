@@ -1,3 +1,4 @@
+from typing import Dict, Optional
 import pika
 import json
 import mysql.connector
